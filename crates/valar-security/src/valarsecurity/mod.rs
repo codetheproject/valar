@@ -1,0 +1,297 @@
+use std::fmt::Debug;
+
+use crate::api::context::Map;
+use crate::valarsecurity::handler::SignOutHandler;
+use crate::valarsecurity::http::Response;
+use crate::valarsecurity::http::{IntoCfSecurityRequest, IntoCfSecurityResponse};
+use context::AuthenticationContext;
+use handler::{Handler, SignInHandler};
+
+pub(crate) mod context;
+pub(crate) mod handler;
+pub(crate) mod http;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub enum Error {
+    #[error("Missing handler in handler map")]
+    MissingHandler,
+    Response(Response),
+}
+
+/// A `Context` represents a collection of handlers and middleware that execute
+/// **before** the main request handler.
+///
+/// The execution flow looks like this:
+///
+/// ```
+/// Request
+///     -> Context (all middleware must succeed; failures are returned immediately)
+///     -> Main Handler
+/// ```
+///
+/// This mechanism allows you to register middleware that runs before each operation.
+/// It is useful for tasks such as logging, rate limiting, security checks, and other
+/// cross-cutting API concerns.
+///
+/// # Example
+///
+/// ```no_run
+/// let cf = CFrameworkSecurity::default()
+///     .add_cookie(CookieOption::default())
+///
+///     // Global middleware: runs for every request.
+///     // Typically you should avoid putting expensive or highly specific logic here.
+///     // More advanced context layers will know which action triggered the request,
+///     // allowing you to make more fine-grained decisions.
+///     .with_layer(
+///         ServiceBuilder::new()
+///             .layer(tracing)
+///             .layer(ratelimiting)
+///     )
+///
+///     // Middleware that runs only for the "sign-in" operation.
+///     .with_sign_in_layer(tracing);
+/// ```
+#[derive(new, Default)]
+pub struct CFrameworkSecurity {
+    handler_map: Map,
+    context: AuthenticationContext,
+}
+
+impl CFrameworkSecurity {
+    #[inline]
+    pub fn handler_map(&self) -> &Map {
+        &self.handler_map
+    }
+
+    #[inline]
+    pub fn handler_map_mut(&mut self) -> &mut Map {
+        &mut self.handler_map
+    }
+
+    #[inline]
+    pub fn context(&self) -> &AuthenticationContext {
+        &self.context
+    }
+
+    #[inline]
+    pub fn context_mut(&mut self) -> &mut AuthenticationContext {
+        &mut self.context
+    }
+
+    /// Registers a new handler and panics if a handler of the same type is already registered.
+    ///
+    /// This method should only be used when registering duplicate handler types is considered a
+    /// programming error. In normal cases, handlers are expected to be unique by type.
+    ///
+    /// # Panics
+    /// Panics if a handler of this type has already been registered.  
+    /// If you need to update or replace an existing handler instead of enforcing uniqueness,
+    /// use [`with_handler`] instead.
+    pub fn register_handler<H>(mut self, handler: H) -> Self
+    where
+        H: Clone + Send + Sync + 'static,
+    {
+        // Panic is hard tho we might try to return result tho but we will see into it
+        let previous = self.handler_map_mut().insert(handler);
+        assert!(previous.is_none(), "Attempted to register a handler of a type that already exists. Handlers must be unique by type.");
+        self
+    }
+
+    pub fn get_handler_ref<H>(&self) -> Option<&H>
+    where
+        H: Clone + Send + Sync + 'static,
+    {
+        self.handler_map.get::<H>()
+    }
+
+    pub fn get_handler_mut<H>(&mut self) -> Option<&mut H>
+    where
+        H: Clone + Send + Sync + 'static,
+    {
+        self.handler_map.get_mut()
+    }
+
+    pub fn with<Request>(&'_ mut self, request: Request) -> WithRequest<'_, Request>
+    where
+        Request: IntoCfSecurityRequest,
+    {
+        WithRequest::new(request, &mut self.handler_map)
+    }
+}
+
+impl Clone for CFrameworkSecurity {
+    fn clone(&self) -> Self {
+        Self {
+            handler_map: self.handler_map.clone(),
+            context: self.context.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CFrameworkSecurity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CFrameworkSecurity")
+            .field("extension", &self.handler_map)
+            .finish()
+    }
+}
+
+#[derive(Debug, new)]
+pub struct WithRequest<'a, Request>
+where
+    Request: IntoCfSecurityRequest,
+{
+    request: Request,
+    handler_map: &'a mut Map,
+}
+
+impl<'a, Request> WithRequest<'a, Request>
+where
+    Request: IntoCfSecurityRequest,
+{
+    #[inline]
+    pub fn handler_map(&self) -> &Map {
+        &self.handler_map
+    }
+
+    #[inline]
+    pub fn handler_map_mut(&mut self) -> &mut Map {
+        &mut self.handler_map
+    }
+
+    #[inline]
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+
+    #[inline]
+    pub fn request_mut(&mut self) -> &mut Request {
+        &mut self.request
+    }
+
+    pub fn unpack(self) -> (Request, &'a mut Map) {
+        (self.request, self.handler_map)
+    }
+}
+
+impl<'a, Request> WithRequest<'a, Request>
+where
+    Request: IntoCfSecurityRequest,
+{
+    // Likely generated by macro rules this helps with refactoring
+    pub async fn authenticate<H, State>(self, state: State) -> Result<Response, Error>
+    where
+        H: Handler<Request, State> + Clone + Send + Sync + 'static,
+        State: Send + Sync,
+    {
+        let (request, handler_map) = self.unpack();
+        let handler = get_handler_from_map::<H>(&handler_map)?;
+
+        authenticate(handler, request, state)
+            .await
+            .map_err(|e| Error::Response(e.into_cf_security_response()))
+            .map(|response| response.into_cf_security_response())
+    }
+
+    pub async fn sign_in<H, State, Payload>(self, state: State, payload: Payload) -> Result<Response, Error>
+    where
+        H: SignInHandler<Request, State, Payload> + Clone + Send + Sync + 'static,
+        State: Send + Sync,
+        Payload: Send + Sync,
+    {
+        let (request, handler_map) = self.unpack();
+        let handler = get_handler_from_map::<H>(&handler_map)?;
+
+        sign_in(handler, request, state, payload)
+            .await
+            .map_err(|e| Error::Response(e.into_cf_security_response()))
+            .map(|response| response.into_cf_security_response())
+    }
+}
+
+pub fn get_handler_from_map<H>(extension: &Map) -> Result<&H, Error>
+where
+    H: Clone + Send + Sync + 'static,
+{
+    extension
+        .get::<H>()
+        .ok_or(Error::MissingHandler)
+}
+
+// There's high chance this would be generated with macro_rules
+// Metrics and logging here would be done
+pub async fn authenticate<H, Request, State>(handler: &H, request: Request, state: State) -> Result<H::Response, H::Error>
+where
+    H: Handler<Request, State> + Clone + Send + Sync + 'static,
+    Request: IntoCfSecurityRequest,
+    State: Send + Sync,
+{
+    handler
+        .authenticate(request, state)
+        .await
+}
+
+pub async fn forbid<H, Request, State>(handler: &H, request: Request, state: State) -> Result<H::Response, H::Error>
+where
+    H: Handler<Request, State> + Clone + Send + Sync + 'static,
+    Request: IntoCfSecurityRequest,
+    State: Send + Sync,
+{
+    handler.forbid(request, state).await
+}
+
+pub async fn challenge<H, Request, State>(handler: &H, request: Request, state: State) -> Result<H::Response, H::Error>
+where
+    H: Handler<Request, State> + Clone + Send + Sync + 'static,
+    Request: IntoCfSecurityRequest,
+    State: Send + Sync,
+{
+    handler.challenge(request, state).await
+}
+
+#[rustfmt::skip]
+pub async fn sign_in<H, Request, State, Payload>(handler: &H, request: Request, state: State, payload: Payload) -> Result<H::Response, H::Error>
+where
+    H: SignInHandler<Request, State, Payload> + Clone + Send + Sync + 'static,
+    Request: IntoCfSecurityRequest,
+    State: Send + Sync,
+    Payload: Send + Sync,
+{
+    handler
+        .sign_in(request, state, payload)
+        .await
+}
+
+#[rustfmt::skip]
+pub async fn sign_out<H, Request, State>(handler: &H, request: Request, state: State) -> Result<H::Response, H::Error>
+where
+    H: SignOutHandler<Request, State> + Clone + Send + Sync + 'static,
+    Request: IntoCfSecurityRequest,
+    State: Send + Sync,
+{
+    handler
+        .sign_out(request, state)
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        api::{CFrameworkSecurity, cookie::CookieHandler},
+        prelude::CookieHandlerExt,
+    };
+
+    #[test]
+    fn test_cframeworksecurity() {
+        let cf = CFrameworkSecurity::default().use_cookie();
+
+        assert!(!cf.handler_map().is_empty(), "Handler map is not empty has len {}", cf.handler_map().len());
+
+        assert!(
+            cf.get_handler_ref::<CookieHandler>()
+                .is_some()
+        )
+    }
+}
